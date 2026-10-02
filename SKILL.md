@@ -117,7 +117,30 @@ divs.forEach(function(div) {
 });
 ```
 
-#### 4c: Extract the full expanded tree
+### Step 4b (FALLBACK): Direct protobuf parsing — use when the viewer hangs on "Downloading..."
+
+The spark-viewer can hang forever at "Downloading..." (observed 2026-08: JS chunks load but the
+data fetch never starts; reloads don't help). The raw protobuf IS fully parseable server-side:
+
+1. Download `https://spark-usercontent.lucko.me/<code>` (26MB for a 14-min report, ~5s).
+2. Fetch official protos via **jsdelivr** (`https://cdn.jsdelivr.net/gh/lucko/spark@master/spark-common/src/main/proto/spark/<file>.proto`) — GitHub raw times out from CN networks. Files: spark.proto, spark_sampler.proto (+ heap/ws if needed). They import each other as `"spark/spark.proto"`, so mirror that subdir layout before compiling.
+3. Compile with grpcio-tools (`pip install grpcio-tools protobuf`), then parse with `spark.spark_sampler_pb2.SamplerData`.
+
+**Ready-made script**: [references/parse_sampler_pb.py](references/parse_sampler_pb.py) — does all of the above and prints platform/window stats, roots, hotspot tree, self-time ranking, per-mod aggregation. Requires grpcio-tools.
+
+Key data-model facts (schema re-verified 2026-08-26 against lucko/spark@master):
+- `StackTraceNode` has NO `id` field and NO `children`: `children_refs` are POSITIONAL INDEXES into that thread's `children` pool (bounds-check each ref). Thread roots = `thread.children_refs`.
+- `SamplerMetadata` fields are `platform_metadata`, `platform_statistics`, `system_statistics`, `sources` (map). `start_time`/`end_time` are epoch MILLISECONDS. `WindowStatistics`: tps, mspt_median, mspt_max, entities, chunks, cpu_process (0-1), players; tile_entities may be -1.
+- `node.times[]` is aligned 1:1 with `SamplerData.time_windows` order. Per-window self time MUST be computed as node.times[p] − sum(children.times[p]) per window p — aggregating self time first then dividing evenly across windows gives wrong correlations (5x error observed).
+- Ready script: [references/parse_sampler_pb.py](references/parse_sampler_pb.py) (top self-time, tree dump, per-window mod share + mspt correlation).
+- Old facts below still apply:
+- Nodes are a FLAT pool: `thread.children` = list of ALL nodes; tree edges are `children_refs` (int indexes into the pool). Thread roots = `thread.children_refs`. Don't recurse over `.children` (proto3 no-defaults makes it empty → AttributeError).
+- Per-window timing: every node has `times` (double per time window, in ms). Self time = node.times − sum(children.times) per window.
+- Mod attribution: `d.class_sources` maps class FQN → mod id. Aggregate self time by it. Vanilla/JDK/native have no source (net.minecraft*, java.*, native.*) — group by package.
+- Root entries named `native.unknown_Java`, `native.not_walkable_Java`, `native.GC_active` are async-profiler overhead buckets, separate from the main thread root.
+- Window stats live in `d.time_window_statistics[window_id]` (tps/mspt/entities/chunks/cpu_process as 0-1 fraction); `time_windows` lists window ids.
+
+### Step 4c: Extract the full expanded tree
 
 Once nodes are expanded, use the DOM walker script (`references/extract-tree.js`). Run via `browser_console`:
 
